@@ -207,25 +207,49 @@ func NewBackoffStore(client kubernetes.Interface,
 	}
 }
 
+type Behavior string
+
+const (
+	Create Behavior = "create"
+	Update Behavior = "update"
+)
+
+func (b *backoffStore) CreateOrUpdateVolume(ctx context.Context, volume *v1.PersistentVolume, behavior Behavior) (*v1.PersistentVolume, error) {
+	if behavior == Create {
+		return b.client.CoreV1().PersistentVolumes().Create(ctx, volume, metav1.CreateOptions{})
+	}
+
+	return b.client.CoreV1().PersistentVolumes().Update(ctx, volume, metav1.UpdateOptions{})
+}
+
 func (b *backoffStore) StoreVolume(logger klog.Logger, claim *v1.PersistentVolumeClaim, volume *v1.PersistentVolume) error {
 	// Try to create the PV object several times
 	var lastSaveError error
+
+	var behavior Behavior = Create
 	err := wait.ExponentialBackoff(*b.backoff, func() (bool, error) {
 		logger.V(4).Info("Trying to save persistentvolume", "persistentvolume", volume.Name)
 		var err error
-		if _, err = b.client.CoreV1().PersistentVolumes().Create(context.Background(), volume, metav1.CreateOptions{}); err == nil || apierrs.IsAlreadyExists(err) {
+
+		_, err = b.CreateOrUpdateVolume(context.Background(), volume, behavior)
+
+		if apierrs.IsAlreadyExists(err) {
 			// Save succeeded.
-			if err != nil {
-				logger.V(2).Info("Persistentvolume already exists, reusing", "persistentvolume", volume.Name)
-			} else {
-				logger.V(4).Info("Persistentvolume saved", "persistentvolume", volume.Name)
-			}
+			logger.V(2).Info("Persistentvolume already exists, reusing", "persistentvolume", volume.Name)
+			return true, nil
+		} else if apierrs.IsInternalError(err) && err.Error() == "resourceVersion should not be set on objects to be created" {
+			logger.V(2).Info("Persistentvolume's resourceVersion is set, update it instead", "resourceVersion", volume.ResourceVersion)
+			behavior = Update
+			return false, nil
+		} else if err != nil {
+			// Save failed, try again after a while.
+			logger.Info("Failed to save persistentvolume", "persistentvolume", volume.Name, "err", err)
+			lastSaveError = err
+			return false, nil
+		} else {
+			logger.V(4).Info("Persistentvolume saved", "persistentvolume", volume.Name)
 			return true, nil
 		}
-		// Save failed, try again after a while.
-		logger.Info("Failed to save persistentvolume", "persistentvolume", volume.Name, "err", err)
-		lastSaveError = err
-		return false, nil
 	})
 
 	if err == nil {
