@@ -213,19 +213,24 @@ func (b *backoffStore) StoreVolume(logger klog.Logger, claim *v1.PersistentVolum
 	err := wait.ExponentialBackoff(*b.backoff, func() (bool, error) {
 		logger.V(4).Info("Trying to save persistentvolume", "persistentvolume", volume.Name)
 		var err error
-		if _, err = b.client.CoreV1().PersistentVolumes().Create(context.Background(), volume, metav1.CreateOptions{}); err == nil || apierrs.IsAlreadyExists(err) {
+
+		_, err = b.client.CoreV1().PersistentVolumes().Create(context.Background(), volume, metav1.CreateOptions{})
+		if apierrs.IsAlreadyExists(err) {
 			// Save succeeded.
-			if err != nil {
-				logger.V(2).Info("Persistentvolume already exists, reusing", "persistentvolume", volume.Name)
-			} else {
-				logger.V(4).Info("Persistentvolume saved", "persistentvolume", volume.Name)
-			}
+			logger.V(2).Info("Persistentvolume already exists, reusing", "persistentvolume", volume.Name)
+			return true, nil
+		} else if apierrs.IsInternalError(err) && err.Error() == "resourceVersion should not be set on objects to be created" {
+			logger.V(2).Info("Persistentvolume's resourceVersion is set, ignore it", "resourceVersion", volume.ResourceVersion)
+			return true, nil
+		} else if err != nil {
+			// Save failed, try again after a while.
+			logger.Info("Failed to save persistentvolume", "persistentvolume", volume.Name, "err", err)
+			lastSaveError = err
+			return false, nil
+		} else {
+			logger.V(4).Info("Persistentvolume saved", "persistentvolume", volume.Name)
 			return true, nil
 		}
-		// Save failed, try again after a while.
-		logger.Info("Failed to save persistentvolume", "persistentvolume", volume.Name, "err", err)
-		lastSaveError = err
-		return false, nil
 	})
 
 	if err == nil {
